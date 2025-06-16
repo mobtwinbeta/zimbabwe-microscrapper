@@ -1,0 +1,136 @@
+
+name: Secure Repository Runner GP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-and-run:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Unmask COUNTRY_CODE
+      run: |
+        echo "::remove-mask name=COUNTRY_CODE::"
+    
+    - name: Get Runner IP
+      id: ip
+      run: |
+        RUNNER_IP=$(curl -s https://api.ipify.org)
+        echo "Runner IP: $RUNNER_IP"
+        echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+        echo "runner_ip=$RUNNER_IP" >> $GITHUB_OUTPUT
+    
+    # Authenticate with Google Cloud
+    - name: Authenticate to GCP
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    # Add firewall rule
+    - name: Allow MongoDB Access
+      run: |
+        # Get current allowed IPs (filter out empty values)
+        CURRENT_IPS=$(gcloud compute firewall-rules describe ${{secrets.FIREWALL_RULE_NAME}} --format="value(sourceRanges)" --project=${{ secrets.GCP_PROJECT }} | tr ';' '\n' | grep -v '^$')
+        
+        # Add new IP while preserving existing ones (with /32 suffix)
+        UPDATED_IPS=$(echo -e "$CURRENT_IPS\n${{ env.RUNNER_IP }}/32" | sort -u | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+        
+        # Update firewall rule
+        gcloud compute firewall-rules update ${{secrets.FIREWALL_RULE_NAME}} --source-ranges="${UPDATED_IPS}" --project=${{ secrets.GCP_PROJECT }}
+
+    - name: Checkout Private Repository API
+      uses: actions/checkout@v3
+      with:
+        repository: Mobtwin/mobtwin_gplay_api
+        token: ${{ secrets.PAT_TOKEN }}
+        path: ./gp-api
+    
+    - name: Checkout Private Repository Explorer
+      uses: actions/checkout@v3
+      with:
+        repository: Mobtwin/gp-explorer-ts
+        token: ${{ secrets.PAT_TOKEN }}
+        path: ./gp-explorer
+        ref: latest-code
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '20'
+    
+    - name: Install PM2 globally
+      run: npm install pm2 -g
+
+    - name: Install Dependencies API
+      run: |
+        cd gp-api
+        npm install
+
+    - name: Run Application API
+      run: |
+        cd gp-api
+        pm2 start src/index.js --name "gp-api"
+    
+    - name: Install Dependencies Explorer
+      run: |
+        cd gp-explorer
+        npm install express cors dotenv @types/express @types/cors @types/dotenv
+        npm install
+        
+    - name: Add Env
+      run: |
+        cd gp-explorer
+        echo "MONGODB_URI=${{ secrets.MONGODB_URI }}" >> .env
+        echo "G_API=http://localhost:3000" >> .env
+        echo "COUNTRY_CODE=${{ secrets.COUNTRY_CODE }}" >> .env
+        echo "RUN_ID=${{ github.run_id }}" >> .env
+        npm run build
+
+    - name: Run Application Explorer
+      run: |
+        cd gp-explorer
+        pm2 start dist/index.js --name "gp-explorer"
+    
+    - name: Wait for app to be ready
+      run: |
+        echo "Waiting 15 seconds for app to start..."
+        sleep 15
+    
+    - name: Start worker
+      run: |
+        curl -X POST http://localhost:8080/start-worker \
+          -H "Content-Type: application/json" \
+          -d '{"type":"charts","workers":1}'
+    
+    - name: Stream Logs
+      run: |
+        pm2 logs --lines 1000 gp-explorer | while read line; do
+          echo "RAW LINE: $line"
+          if [[ "$line" == *"microScrapper off!"* ]]; then
+            echo "MATCH FOUND - EXITING"
+            pkill -f "pm2 logs"
+            break
+          fi
+        done
+        
+        # This will execute after the loop breaks
+        pm2 delete gp-explorer
+  
+    # Remove firewall rule (even if job fails)
+    - name: Remove MongoDB Access
+      if: always()
+      run: |
+        # Get current IPs excluding our current runner
+        UPDATED_IPS=$(gcloud compute firewall-rules describe ${{secrets.FIREWALL_RULE_NAME}} \
+          --format="value(sourceRanges)" \
+          --project=${{ secrets.GCP_PROJECT }} | tr ';' '\n' \
+          | grep -v "^${{ env.RUNNER_IP }}/32$" \
+          | grep -v '^$' | sort -u | tr '\n' ',' | sed 's/,$//')
+        
+        # Update firewall rule
+        gcloud compute firewall-rules update ${{secrets.FIREWALL_RULE_NAME}} \
+          --source-ranges="${UPDATED_IPS}" \
+          --project=${{ secrets.GCP_PROJECT }}
